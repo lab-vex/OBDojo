@@ -1,0 +1,173 @@
+# Builds the ESP32 firmware and the Android app on every push.
+# Download the results from the run's "Artifacts" section, or from the release once one exists.
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Firmware logic tests (simulated Ninja 300 K-line)
+        run: ./test/run.sh
+
+      - name: Web page script parses
+        run: python3 tools/check_web_js.py
+
+      - name: App demo mode has the firmware's settings
+        run: python3 tools/check_demo_defs.py
+
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core 3.3.12
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.3.12
+
+      - name: Compile
+        run: |
+          arduino-cli compile \
+            --fqbn esp32:esp32:esp32:PartitionScheme=huge_app \
+            --warnings default \
+            --output-dir out \
+            firmware/obdojo
+          ls -la out
+
+      - name: Name the binaries
+        run: |
+          mkdir dist
+          cp out/obdojo.ino.bin dist/obdojo-firmware.bin
+          # merged = bootloader + partitions + app, flash at 0x0 with any ESP flasher
+          if [ -f out/obdojo.ino.merged.bin ]; then cp out/obdojo.ino.merged.bin dist/obdojo-firmware-full.bin; fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: obdojo-firmware
+          path: dist/
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      # Every build is signed with the same permanent key so the app can update itself.
+      # OBDOJO_KEY_ALIAS is optional: without it the first key in the keystore is used.
+      - name: Signing key
+        env:
+          KS_B64: ${{ secrets.OBDOJO_KEYSTORE_B64 }}
+          KS_PW: ${{ secrets.OBDOJO_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.OBDOJO_KEY_ALIAS }}
+        run: |
+          if [ -n "$KS_B64" ]; then
+            # strip any spaces / line breaks picked up when pasting the secrets
+            printf '%s' "$KS_B64" | tr -d ' \r\n\t' | base64 -d > "$RUNNER_TEMP/obdojo.jks" \
+              || { echo "::error::OBDOJO_KEYSTORE_B64 isn't valid base64 - re-paste it"; exit 1; }
+            PW=$(printf '%s' "$KS_PW" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            keytool -list -keystore "$RUNNER_TEMP/obdojo.jks" -storepass "$PW" >/dev/null 2>&1 \
+              || { echo "::error::Signing key won't open: OBDOJO_KEYSTORE_PASSWORD doesn't match OBDOJO_KEYSTORE_B64 (check for typos or a truncated paste)"; exit 1; }
+            ALIAS=$(printf '%s' "$KS_ALIAS" | tr -d ' \r\n\t')
+            if [ -z "$ALIAS" ]; then
+              ALIAS=$(keytool -list -v -keystore "$RUNNER_TEMP/obdojo.jks" -storepass "$PW" | sed -n 's/^Alias name: //p' | head -1)
+            fi
+            keytool -list -keystore "$RUNNER_TEMP/obdojo.jks" -storepass "$PW" -alias "$ALIAS" >/dev/null 2>&1 \
+              || { echo "::error::No key called '$ALIAS' in the keystore"; exit 1; }
+            echo "Signing with key '$ALIAS'"
+            echo "::add-mask::$PW"
+            echo "OBDOJO_KEYSTORE=$RUNNER_TEMP/obdojo.jks" >> "$GITHUB_ENV"
+            echo "OBDOJO_KEYSTORE_PASSWORD=$PW" >> "$GITHUB_ENV"
+            echo "OBDOJO_KEY_ALIAS=$ALIAS" >> "$GITHUB_ENV"
+          else
+            echo "::warning::No signing secret: this APK uses a throwaway debug key and can't update a release install"
+          fi
+
+      - name: Build APK
+        working-directory: android
+        run: |
+          set -o pipefail
+          gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee "$RUNNER_TEMP/gradle.log"
+
+      # Turn compile errors into annotations, readable without downloading the full log
+      - name: Show build errors
+        if: failure()
+        run: |
+          grep -E "^e: |What went wrong|Execution failed|^> [^T]|keystore|signing" "$RUNNER_TEMP/gradle.log" \
+            | grep -v "^> Run with\|^> Get more help" | head -25 | while IFS= read -r l; do echo "::error::$l"; done
+
+      - name: Name the APK
+        run: |
+          mkdir dist
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist/obdojo-app.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: obdojo-app
+          path: dist/
+
+  # Auto-release: a push to main with a new versionName publishes v<versionName> with the APK and
+  # firmware attached. Pushes that don't change the version (tag already exists) do nothing.
+  # Until the signing secrets are set it skips the release (with a warning) instead of failing:
+  # add them, then re-run this workflow and the release goes out.
+  release:
+    needs: [tests, firmware, android]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: New version?
+        id: ver
+        env:
+          HAS_KEY: ${{ secrets.OBDOJO_KEYSTORE_B64 != '' }}
+        run: |
+          v=$(grep -oP 'versionName = "\K[^"]+' android/app/build.gradle.kts)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/v$v" >/dev/null; then
+            echo "v$v is already released, nothing to do"
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          elif [ "$HAS_KEY" != "true" ]; then
+            echo "::warning::Not releasing v$v yet: add the OBDOJO_KEYSTORE_B64 and OBDOJO_KEYSTORE_PASSWORD repo secrets, then re-run this workflow"
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Releasing v$v"
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/download-artifact@v4
+        if: steps.ver.outputs.new == 'true'
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        if: steps.ver.outputs.new == 'true'
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: v${{ steps.ver.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          files: dist/*
+          generate_release_notes: true
+          make_latest: true
