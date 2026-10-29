@@ -14,7 +14,7 @@ android {
         targetSdk = 34
         // Only versionName needs bumping: versionCode is worked out from it (1.2.1 -> 10201),
         // so every release can install over the last one.
-        versionName = "1.0.0"
+        versionName = "1.0.1"
         versionCode = versionName!!.split(".").map { it.toInt() }.let { (a, b, c) -> a * 10000 + b * 100 + c }
     }
 
